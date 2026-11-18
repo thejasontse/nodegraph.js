@@ -1868,10 +1868,12 @@ export class Renderer {
   render(model, selectedEdgeId, selectedNodeIds, selectedGroupIds, dragging = false) {
     const selNodes = selectedNodeIds instanceof Set ? selectedNodeIds : new Set(selectedNodeIds ? [selectedNodeIds] : []);
     const selGroups = selectedGroupIds instanceof Set ? selectedGroupIds : new Set(selectedGroupIds ? [selectedGroupIds] : []);
-    // wipe every content layer (indicatorLayer is excluded — it survives render
-    // frames during a gesture and is cleared when the gesture ends)
+    // wipe every content layer (indicatorLayer and marqueeLayer are excluded —
+    // they survive render frames during a gesture and are cleared when the
+    // gesture ends. The marquee band is owned by the drag, not by render(), so
+    // wiping it here would erase the rubber band ~16ms after each draw.)
     for (const layer of [
-      this.marqueeLayer, this.groupsLayer, this.groupPortsLayer, this.edgesHitLayer,
+      this.groupsLayer, this.groupPortsLayer, this.edgesHitLayer,
       this.segHitLayer, this.nodesLayer, this.edgesLayer, this.overlayLayer,
     ]) layer.textContent = '';
     for (const group of model.groups || []) this.#renderGroup(group, selGroups.has(group.id));
@@ -3455,6 +3457,9 @@ function setupInteractions(model, renderer, render, history) {
       selGroups.clear();
       for (const id of hitGroups) selGroups.add(id);
       scheduleRender();
+      // Draw after scheduling: render() no longer wipes marqueeLayer, so the
+      // band persists across frames. Drawing last keeps the rect on top of any
+      // nodes selected this frame.
       renderer.drawMarquee(x, y, w, h);
     }
   };
