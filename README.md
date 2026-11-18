@@ -231,7 +231,6 @@ section it lives in) so you can build custom tooling without a UI:
 | File | Purpose |
 |---|---|
 | `nodegraph.js` | the library — seven documented sections: STYLE, MODEL, GEOMETRY, RENDERER, INTERACTIONS, PDF EXPORT, PUBLIC API |
-| `nodegraph.min.js` | compact build of the same code (comments stripped, CSS inlined) |
 | `index.html` | the demo |
 | `server.js` | minimal static server: `node server.js [port]` |
 
@@ -243,5 +242,4 @@ runs under Node + jsdom from `/tmp/ngtest`: `node smoke.mjs`, `geom.mjs`,
 `paramorder.mjs`, `copy.mjs`, `undo.mjs`, `edecycle.mjs`, `edgecolor.mjs`,
 `color.mjs`, `test-label.mjs`, `layer.mjs`, `regress.mjs`, `fixes7.mjs`, plus
 `pdfval.mjs`, which round-trips the PDF through pdf-lib to prove the bytes are
-a valid, readable document. `min-*.mjs` mirror the same suites against
-`nodegraph.min.js`.
+a valid, readable document.

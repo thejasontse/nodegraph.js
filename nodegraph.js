@@ -134,6 +134,7 @@ export const NG_CSS = `/* nodegraph.css — minimal themeable styles.
   fill: var(--ng-group-port);
   stroke: var(--ng-group-port);
   stroke-width: 1;
+  stroke-linejoin: round;
   cursor: move;
 }
 .ng-group-port:hover { stroke-width: 3; }
@@ -143,6 +144,7 @@ export const NG_CSS = `/* nodegraph.css — minimal themeable styles.
   fill: var(--ng-group-port);
   stroke: var(--ng-bg);
   stroke-width: 2;
+  stroke-linejoin: round;
   opacity: 0.75;
   pointer-events: none;
 }
@@ -195,7 +197,7 @@ export const NG_CSS = `/* nodegraph.css — minimal themeable styles.
 
 /* ports — solid dots (the fill colour is the port's own), drawn above the
    node border so nothing clips them */
-.ng-port { stroke-width: 1; cursor: crosshair; }
+.ng-port { stroke-width: 1; stroke-linejoin: round; cursor: crosshair; }
 .ng-port-in { fill: var(--ng-port-in); stroke: var(--ng-port-in); }
 .ng-port-out { fill: var(--ng-port-out); stroke: var(--ng-port-out); }
 .ng-port:hover { stroke-width: 3; }
@@ -685,12 +687,21 @@ export function edgeEnds(model, edge) {
 // adjust dance that every port-moving operation needs (see
 // adjustPointsForMove). Only edges with manual waypoints are touched; an edge
 // whose endpoints stop resolving mid-mutate is skipped.
-function followWaypoints(model, watch, mutate) {
+// When `rigid` is provided, edges it returns true for are treated as moving as a
+// whole: BOTH endpoints translated by the same (dx, dy), so every waypoint —
+// prefix, middle segments, and suffix alike — shifts rigidly rather than just
+// having its port-adjacent run nudged perpendicular. This is what a group drag
+// needs; without it the interior segments lag behind horizontally. `rigid` must
+// be evaluated BEFORE `mutate` runs (it inspects pre-move endpoint refs).
+function followWaypoints(model, watch, mutate, rigid = null) {
   const prev = new Map();
+  const rigidEdges = new Set();
   for (const edge of model.edges) {
     if (!edge.points.length || !watch(edge)) continue;
     const ends = edgeEnds(model, edge);
-    if (ends) prev.set(edge.id, { a: { ...ends.a }, b: { ...ends.b } });
+    if (!ends) continue;
+    prev.set(edge.id, { a: { ...ends.a }, b: { ...ends.b } });
+    if (rigid && rigid(edge)) rigidEdges.add(edge.id);
   }
   const result = mutate();
   for (const edge of model.edges) {
@@ -698,7 +709,13 @@ function followWaypoints(model, watch, mutate) {
     if (!p) continue;
     const ends = edgeEnds(model, edge);
     if (!ends) continue;
-    edge.points = adjustPointsForMove(edge.points, ends.a, ends.b, p.a, p.b);
+    if (rigidEdges.has(edge.id)) {
+      const dx = ends.a.x - p.a.x;
+      const dy = ends.a.y - p.a.y;
+      edge.points = edge.points.map((pt) => ({ x: pt.x + dx, y: pt.y + dy }));
+    } else {
+      edge.points = adjustPointsForMove(edge.points, ends.a, ends.b, p.a, p.b);
+    }
   }
   return result;
 }
@@ -712,11 +729,14 @@ function followWaypoints(model, watch, mutate) {
 export function moveGroupsBy(model, groupIds, nodeIds, dx, dy) {
   const moved = new Set(nodeIds);
   const movedGroups = new Set(groupIds);
+  // An endpoint counts as "inside" when it is a member node or a boundary port of
+  // a moved group. When BOTH endpoints are inside, the edge moves rigidly with the
+  // group and every waypoint (including interior/middle segments) translates by
+  // (dx, dy); an edge with one endpoint outside keeps the stretch behaviour.
+  const inside = (ref) => moved.has(ref.node) || movedGroups.has(ref.group);
   followWaypoints(
     model,
-    (edge) =>
-      moved.has(edge.source.node) || moved.has(edge.target.node) ||
-      movedGroups.has(edge.source.group) || movedGroups.has(edge.target.group),
+    (edge) => inside(edge.source) || inside(edge.target),
     () => {
       for (const gid of groupIds) {
         const g = findGroup(model, gid);
@@ -733,6 +753,7 @@ export function moveGroupsBy(model, groupIds, nodeIds, dx, dy) {
         }
       }
     },
+    (edge) => inside(edge.source) && inside(edge.target),
   );
 }
 
@@ -1057,6 +1078,24 @@ export function readableTextOn(bg) {
 export function topRoundedRectPath(w, h, r) {
   const rr = Math.max(0, Math.min(r, w / 2, h / 2));
   return `M 0 ${h} L 0 ${rr} Q 0 0 ${rr} 0 L ${w - rr} 0 Q ${w} 0 ${w} ${rr} L ${w} ${h} Z`;
+}
+
+// Ports are drawn as small arrowheads that always point to the right. The apex
+// sits at (cx + r, cy) and the two back corners trail to the left, so the shape
+// reads as a triangle regardless of whether it is an input or output port.
+// Shared by the SVG renderer and the PDF exporter so both draw the same mark.
+export function portTrianglePoints(cx, cy, r = 5) {
+  return [
+    { x: cx + r, y: cy },
+    { x: cx - r * 0.7, y: cy - r * 0.9 },
+    { x: cx - r * 0.7, y: cy + r * 0.9 },
+  ];
+}
+
+// SVG path `d` string for a right-pointing port triangle.
+export function portTrianglePath(cx, cy, r = 5) {
+  const [a, b, c] = portTrianglePoints(cx, cy, r);
+  return `M ${a.x} ${a.y} L ${b.x} ${b.y} L ${c.x} ${c.y} Z`;
 }
 
 // Graph-space position of a port circle. Every param has both ports:
@@ -1678,7 +1717,7 @@ export class Renderer {
       return `#${hex(ch(b.r, c.r))}${hex(ch(b.g, c.g))}${hex(ch(b.b, c.b))}`;
     };
 
-    const scene = { margin: 20, background: colors.bg, rects: [], circles: [], paths: [], texts: [] };
+    const scene = { margin: 20, background: colors.bg, rects: [], circles: [], triangles: [], paths: [], texts: [] };
     const nodes = model.nodes.filter((nd) => ids.has(nd.id));
     // Groups that actually get drawn. A group is on the page when it contains
     // ≥1 exported node (centre-based membership) OR one of its boundary ports
@@ -1716,7 +1755,7 @@ export class Renderer {
       // boundary ports ride on the border, drawn after the rects so nothing clips them
       for (const port of group.ports || []) {
         const pp = groupPortPos(group, port);
-        scene.circles.push({ x: pp.x, y: pp.y, r: 5, fill: colors.groupPort, stroke: colors.groupPort, strokeWidth: 1 });
+        scene.triangles.push({ pts: portTrianglePoints(pp.x, pp.y), fill: colors.groupPort, stroke: colors.groupPort, strokeWidth: 1 });
       }
     }
 
@@ -1740,9 +1779,9 @@ export class Renderer {
       node.params.forEach((param, i) => {
         const y = node.y + HEADER_H + i * ROW_H + ROW_H / 2;
         scene.texts.push({ x: node.x + 14, y: y + 4, text: param.name, size: 12, fill: colors.text });
-        // solid port dots, drawn after the border so nothing clips them
-        scene.circles.push({ x: node.x, y, r: 5, fill: colors.portIn, stroke: colors.portIn, strokeWidth: 1 });
-        scene.circles.push({ x: node.x + w, y, r: 5, fill: colors.portOut, stroke: colors.portOut, strokeWidth: 1 });
+        // solid port arrowheads, drawn after the border so nothing clips them
+        scene.triangles.push({ pts: portTrianglePoints(node.x, y), fill: colors.portIn, stroke: colors.portIn, strokeWidth: 1 });
+        scene.triangles.push({ pts: portTrianglePoints(node.x + w, y), fill: colors.portOut, stroke: colors.portOut, strokeWidth: 1 });
       });
     }
 
@@ -1880,7 +1919,7 @@ export class Renderer {
     // larger hit circle so it is easy to grab, exactly like a node's port.
     for (const port of group.ports || []) {
       const p = groupPortPos(group, port);
-      el('circle', { cx: p.x, cy: p.y, r: 5, class: 'ng-group-port', 'data-gport': group.id, 'data-gport-id': port.id, 'data-group': group.id }, this.groupPortsLayer);
+      el('path', { d: portTrianglePath(p.x, p.y), class: 'ng-group-port', 'data-gport': group.id, 'data-gport-id': port.id, 'data-group': group.id }, this.groupPortsLayer);
       el('circle', { cx: p.x, cy: p.y, r: 10, class: 'ng-port-hit ng-gport-hit', 'data-gport': group.id, 'data-gport-id': port.id, 'data-group': group.id }, this.groupPortsLayer);
     }
     if (selected) {
@@ -1945,8 +1984,8 @@ export class Renderer {
       const rm = el('text', { x: w - 16, y: y + ROW_H / 2 + 4, class: 'ng-btn ng-btn-danger', 'data-role': 'delete-param' }, row);
       rm.textContent = '−';
 
-      el('circle', { cx: 0, cy: y + ROW_H / 2, r: 5, class: 'ng-port ng-port-in', 'data-port': 'in', 'data-node': node.id, 'data-param': param.id }, row);
-      el('circle', { cx: w, cy: y + ROW_H / 2, r: 5, class: 'ng-port ng-port-out', 'data-port': 'out', 'data-node': node.id, 'data-param': param.id }, row);
+      el('path', { d: portTrianglePath(0, y + ROW_H / 2), class: 'ng-port ng-port-in', 'data-port': 'in', 'data-node': node.id, 'data-param': param.id }, row);
+      el('path', { d: portTrianglePath(w, y + ROW_H / 2), class: 'ng-port ng-port-out', 'data-port': 'out', 'data-node': node.id, 'data-param': param.id }, row);
       // invisible larger hit targets so ports are easy to grab
       el('circle', { cx: 0, cy: y + ROW_H / 2, r: 10, class: 'ng-port-hit', 'data-port': 'in', 'data-node': node.id, 'data-param': param.id }, row);
       el('circle', { cx: w, cy: y + ROW_H / 2, r: 10, class: 'ng-port-hit', 'data-port': 'out', 'data-node': node.id, 'data-param': param.id }, row);
@@ -3228,7 +3267,7 @@ function setupInteractions(model, renderer, render, history) {
             ? { x1: g.x, y1: g.y, x2: g.x, y2: g.y + g.h }
             : { x1: g.x + g.w, y1: g.y, x2: g.x + g.w, y2: g.y + g.h };
     el('line', { ...ends, class: 'ng-group-border-hint' }, renderer.indicatorLayer);
-    el('circle', { cx: cand.x, cy: cand.y, r: 5, class: 'ng-port-ghost' }, renderer.indicatorLayer);
+    el('path', { d: portTrianglePath(cand.x, cand.y), class: 'ng-port-ghost' }, renderer.indicatorLayer);
   };
 
   // Orient a drop so the edge always runs out → in, whichever end the drag
@@ -3708,6 +3747,13 @@ function circlePath(t, cx, cy, r) {
   );
 }
 
+// Right-pointing port arrowhead as a closed triangle path (matches the SVG
+// `portTrianglePath` shape so the PDF export looks like the canvas).
+function trianglePath(t, pts) {
+  const { P } = pathHelpers(t);
+  return `${P(pts[0].x, pts[0].y)} m ${P(pts[1].x, pts[1].y)} l ${P(pts[2].x, pts[2].y)} l h `;
+}
+
 // Filled arrowhead at the end of a polyline, aligned with its last run.
 function arrowPath(t, pts, size = 9, half = 3.5) {
   if (pts.length < 2) return '';
@@ -3744,6 +3790,10 @@ function sceneBounds(scene) {
     stroke(c.strokeWidth);
     grow(n(c.x) - n(c.r), n(c.y) - n(c.r));
     grow(n(c.x) + n(c.r), n(c.y) + n(c.r));
+  }
+  for (const tri of scene.triangles || []) {
+    stroke(tri.strokeWidth);
+    for (const pt of tri.pts || []) grow(n(pt.x), n(pt.y));
   }
   for (const p of scene.paths || []) {
     stroke(p.strokeWidth);
@@ -3794,6 +3844,11 @@ export function buildPDF(scene = {}) {
 
   for (const c of scene.circles || []) {
     emitShape(c, circlePath(t, n(c.x), n(c.y), n(c.r)));
+  }
+
+  for (const tri of scene.triangles || []) {
+    if (!tri.pts || tri.pts.length < 3) continue;
+    emitShape(tri, trianglePath(t, tri.pts));
   }
 
   for (const p of scene.paths || []) {
