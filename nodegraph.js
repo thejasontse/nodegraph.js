@@ -405,8 +405,88 @@ export function createModel() {
   return { nodes: [], edges: [], groups: [] };
 }
 
+// --- edge label metrics -----------------------------------------------------
+// The label hit box needs the rendered text width. getBBox() forces layout on
+// every call, which is measurable during full re-renders, so widths are cached
+// per string: a one-time canvas measurement (the same 10px system-ui font as
+// .ng-edge-label), with a character-count estimate as the fallback when no
+// canvas/layout is available (jsdom).
+const labelWidthCache = new Map();
+let labelMeasureCtx = null;
+let labelMeasureChecked = false;
+
+export function labelWidth(text) {
+  const hit = labelWidthCache.get(text);
+  if (hit !== undefined) return hit;
+  if (!labelMeasureChecked) {
+    labelMeasureChecked = true;
+    try {
+      if (typeof document !== 'undefined' && document.createElement) {
+        const c = document.createElement('canvas');
+        if (c && c.getContext) labelMeasureCtx = c.getContext('2d') || null;
+        if (labelMeasureCtx) labelMeasureCtx.font = '10px system-ui, sans-serif';
+      }
+    } catch { /* no canvas: fall back to the estimate */ }
+  }
+  // +16 keeps the original padding around the glyph run.
+  const w = Math.ceil(labelMeasureCtx
+    ? labelMeasureCtx.measureText(text).width
+    : text.length * 6.5) + 16;
+  labelWidthCache.set(text, w);
+  return w;
+}
+
+// --- id indexes ---// With hundreds of nodes/edges, linear scans in findNode/findEdge/findGroup
+// dominate pointer/gesture work (every hover, drag tick and render looks ids up
+// repeatedly). The maps below are rebuilt lazily when the backing array
+// reference changes (filters/splices/swaps) or invalidateIndexes() is called
+// after an in-place push. Entries key on the id strings, which are unique per
+// kind (uid prefixes n/e/g/p) and never reused.
+let indexModel = null;
+let indexMaps = null;
+
+function indexes(model) {
+  if (!indexModel || indexModel !== model) {
+    indexModel = model;
+    indexMaps = { nodes: new Map(), edges: new Map(), groups: new Map() };
+  }
+  return indexMaps;
+}
+
+export function invalidateIndexes() {
+  indexModel = null;
+  indexMaps = null;
+}
+
+function indexNodes(model) {
+  const m = indexes(model);
+  if (m.nodesArr !== model.nodes) {
+    m.nodesArr = model.nodes;
+    m.nodes = new Map(model.nodes.map((n) => [n.id, n]));
+  }
+  return m.nodes;
+}
+
+function indexEdges(model) {
+  const m = indexes(model);
+  if (m.edgesArr !== model.edges) {
+    m.edgesArr = model.edges;
+    m.edges = new Map(model.edges.map((e) => [e.id, e]));
+  }
+  return m.edges;
+}
+
+function indexGroups(model) {
+  const m = indexes(model);
+  if (m.groupsArr !== model.groups) {
+    m.groupsArr = model.groups;
+    m.groups = new Map((model.groups || []).map((g) => [g.id, g]));
+  }
+  return m.groups;
+}
+
 export function findNode(model, id) {
-  return model.nodes.find((n) => n.id === id);
+  return indexNodes(model).get(id);
 }
 
 // --- nodes ---
@@ -421,12 +501,15 @@ export function addNode(model, { x = 0, y = 0, label = 'Node', params = [], widt
   };
   if (Number.isFinite(Number(width))) node.width = Math.max(100, Number(width));
   model.nodes.push(node);
+  invalidateRects();
+  indexes(model).nodes.set(node.id, node);
   return node;
 }
 
 export function removeNode(model, id) {
   model.nodes = model.nodes.filter((n) => n.id !== id);
   dropEdges(model, (e) => e.source.node === id || e.target.node === id);
+  invalidateRects();
 }
 
 export function setNodeLabel(model, id, label) {
@@ -439,13 +522,17 @@ export function moveNode(model, id, x, y) {
   if (node) {
     node.x = x;
     node.y = y;
+    invalidateRects();
   }
 }
 
 // Set a node's width in graph units (clamped to a usable minimum).
 export function setNodeWidth(model, id, width) {
   const node = findNode(model, id);
-  if (node) node.width = Math.max(100, Number(width) || 0);
+  if (node) {
+    node.width = Math.max(100, Number(width) || 0);
+    invalidateRects();
+  }
 }
 
 // Set a node's accent colour (a #rrggbb / #rgb hex string, or null to restore
@@ -462,6 +549,7 @@ export function addParam(model, nodeId, { name = 'param' } = {}) {
   if (!node) return null;
   const param = { id: uid('p'), name };
   node.params.push(param);
+  invalidateRects();
   return param;
 }
 
@@ -470,6 +558,7 @@ export function removeParam(model, nodeId, paramId) {
   if (!node) return;
   node.params = node.params.filter((p) => p.id !== paramId);
   dropEdges(model, (e) => touches(e, nodeId, paramId));
+  invalidateRects();
 }
 
 // Reorder a node's params by moving the param with `paramId` to index
@@ -484,13 +573,14 @@ export function moveParam(model, nodeId, paramId, toIndex) {
   if (to === from) return false;
   const [param] = node.params.splice(from, 1);
   node.params.splice(to, 0, param);
+  invalidateRects();
   return true;
 }
 
 // --- edges ---
 
 function findEdge(model, id) {
-  return model.edges.find((e) => e.id === id);
+  return indexEdges(model).get(id);
 }
 
 // An edge endpoint is a ref: either a param port { node, param } or a group
@@ -523,11 +613,13 @@ export function connect(model, source, target) {
   if (dup) throw new Error('Edge already exists');
   const edge = { id: uid('e'), source: { ...source }, target: { ...target }, label: '', labelT: 0.5, points: [] };
   model.edges.push(edge);
+  indexes(model).edges.set(edge.id, edge);
   return edge;
 }
 
 export function removeEdge(model, id) {
   model.edges = model.edges.filter((e) => e.id !== id);
+  routeCache.delete(id); // drop the dead edge's memoised route
 }
 
 // Set the edge's single label text.
@@ -564,7 +656,7 @@ export function setEdgePoints(model, id, points) {
 // node currently inside it; resizing just changes the box.
 
 export function findGroup(model, id) {
-  return (model.groups || []).find((g) => g.id === id);
+  return indexGroups(model).get(id);
 }
 
 export function addGroup(model, { x = 0, y = 0, w = 320, h = 220, label = 'Group', color = null } = {}) {
@@ -579,6 +671,7 @@ export function addGroup(model, { x = 0, y = 0, w = 320, h = 220, label = 'Group
   };
   if (color) group.color = color;
   model.groups.push(group);
+  indexes(model).groups.set(group.id, group);
   return group;
 }
 
@@ -755,6 +848,7 @@ export function moveGroupsBy(model, groupIds, nodeIds, dx, dy) {
     },
     (edge) => inside(edge.source) && inside(edge.target),
   );
+  invalidateRects();
 }
 
 // --- helpers ---
@@ -922,6 +1016,7 @@ export function pasteSnapshot(model, snap, dx, dy) {
       points: e.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
     });
   }
+  invalidateRects();
   return { nodeIds: new Set([...nodeId.values()]), groupIds: new Set([...groupId.values()]) };
 }
 
@@ -1229,8 +1324,30 @@ function simplify(pts) {
 }
 
 // Bounding boxes of every node — the obstacles an auto-routed edge must avoid.
+// Memoised per model: several call sites within one frame (render, segment
+// drag, label drag) otherwise rebuild identical arrays, and the router scans
+// them heavily. Invalidate with invalidateRects() after any change to node
+// positions or sizes; a changed nodes array reference invalidates by itself.
+let rectsCacheModel = null;
+let rectsCacheArray = null;
+let rectsCache = null;
+export function invalidateRects() {
+  rectsCache = null;
+  routeCache.clear(); // node positions/sizes changed → cached corridors are stale
+  // node/edge/group sets changed together everywhere a rect changes; rebuilding
+  // both caches at once keeps the two invalidation paths trivially consistent.
+  invalidateIndexes();
+}
 export function nodeRects(model) {
-  return model.nodes.map((n) => ({ x: n.x, y: n.y, w: nodeWidth(n), h: nodeHeight(n) }));
+  if (
+    rectsCache &&
+    rectsCacheModel === model &&
+    rectsCacheArray === model.nodes
+  ) return rectsCache;
+  rectsCache = model.nodes.map((n) => ({ x: n.x, y: n.y, w: nodeWidth(n), h: nodeHeight(n) }));
+  rectsCacheModel = model;
+  rectsCacheArray = model.nodes;
+  return rectsCache;
 }
 
 // A node belongs to a group when its centre lies inside the group's rectangle.
@@ -1296,6 +1413,36 @@ export function groupClosure(model, rootIds) {
 // straight is free and turning costs 1 — i.e. a minimum-bend path. The edge
 // leaves `a` to the right and enters `b` from the left (both horizontal), so
 // short horizontal stubs clear the two ports before the search begins.
+// Expanding keep-out margin around node rects for the obstacle router.
+const ROUTE_MARGIN = GRID;
+
+// --- auto-route memo -------------------------------------------------------
+// The BFS in routeOrthogonal() is O(grid × nodes) per edge, and a full render
+// re-routes every auto edge. During drags most edges' corridors are unchanged,
+// so each edge's result is cached against a signature of its endpoint coords
+// plus the rects overlapping its expanded bounding corridor: if nothing inside
+// the corridor moved, the minimum-bend route provably cannot change.
+const routeCache = new Map(); // edgeId -> { sig, pts }
+
+export function invalidateRoutes() {
+  routeCache.clear();
+}
+
+function routeSignature(a, b, rects) {
+  const pad = 2 * GRID + 2 * ROUTE_MARGIN;
+  const x0 = Math.min(a.x, b.x) - pad;
+  const x1 = Math.max(a.x, b.x) + pad;
+  const y0 = Math.min(a.y, b.y) - pad;
+  const y1 = Math.max(a.y, b.y) + pad;
+  let s = `${a.x},${a.y}|${b.x},${b.y}|`;
+  for (const r of rects) {
+    if (r.x < x1 && r.x + r.w > x0 && r.y < y1 && r.y + r.h > y0) {
+      s += `${r.x}:${r.y}:${r.w}:${r.h};`;
+    }
+  }
+  return s;
+}
+
 function routeOrthogonal(a, b, obstacles, M = GRID) {
   const S = GRID; // stub length out of each port
   const aStub = { x: a.x + S, y: a.y };
@@ -1326,20 +1473,65 @@ function routeOrthogonal(a, b, obstacles, M = GRID) {
   const ti = X.indexOf(bStub.x);
   const tj = Y.indexOf(bStub.y);
 
-  // A segment is blocked only when it cuts through a rect's INTERIOR; running
-  // along a rect's boundary line is always allowed (routes hug node edges).
-  const blockedH = (j, i0, i1) => {
+  // When the plain Z-route through the corridor's centre line is completely
+  // clear of obstacles, it is provably a minimum-bend route (any path needs at
+  // least one turn per port) — skip the BFS entirely. The test: no grown rect
+  // may strictly contain a point of the three legs (the two stub columns and
+  // the mid-line bridge). Rects merely touching a leg are fine: the BFS hugs
+  // boundaries legally too, so both routers agree.
+  const midY = snapToGrid((aStub.y + bStub.y) / 2); // keep the bridge on the grid
+  const hitsV = (x, y0, y1) => {
+    const lo = Math.min(y0, y1);
+    const hi = Math.max(y0, y1);
+    return rects.some((r) => r.x < x && x < r.x + r.w && r.y < hi && lo < r.y + r.h);
+  };
+  const hitsH = (y, x0, x1) => {
+    const lo = Math.min(x0, x1);
+    const hi = Math.max(x0, x1);
+    return rects.some((r) => r.y < y && y < r.y + r.h && r.x < hi && lo < r.x + r.w);
+  };
+  const clear = !hitsV(aStub.x, aStub.y, midY) &&
+                !hitsH(midY, aStub.x, bStub.x) &&
+                !hitsV(bStub.x, midY, bStub.y);
+  if (clear) {
+    return Math.abs(aStub.x - bStub.x) < 0.5
+      ? [{ x: aStub.x, y: midY }] // same column: single mid bend
+      : [{ x: aStub.x, y: midY }, { x: bStub.x, y: midY }];
+  }
+
+  // Per grid line, the sorted rect-interior spans it crosses. A move between
+  // adjacent lines is blocked exactly when its open interval overlaps a span —
+  // boundary lines stay free (routes hug node edges). Built once per route
+  // instead of scanning every rect on every BFS step.
+  const spansH = new Array(ny);
+  const spansV = new Array(nx);
+  for (let j = 0; j < ny; j++) {
     const y = Y[j];
-    const lo = Math.min(X[i0], X[i1]);
-    const hi = Math.max(X[i0], X[i1]);
-    return rects.some((r) => y > r.y && y < r.y + r.h && hi > r.x && lo < r.x + r.w);
-  };
-  const blockedV = (i, j0, j1) => {
+    const list = [];
+    for (const r of rects) if (y > r.y && y < r.y + r.h) list.push([r.x, r.x + r.w]);
+    list.sort((p, q) => p[0] - q[0]);
+    spansH[j] = list;
+  }
+  for (let i = 0; i < nx; i++) {
     const x = X[i];
-    const lo = Math.min(Y[j0], Y[j1]);
-    const hi = Math.max(Y[j0], Y[j1]);
-    return rects.some((r) => x > r.x && x < r.x + r.w && hi > r.y && lo < r.y + r.h);
+    const list = [];
+    for (const r of rects) if (x > r.x && x < r.x + r.w) list.push([r.y, r.y + r.h]);
+    list.sort((p, q) => p[0] - q[0]);
+    spansV[i] = list;
+  }
+  // Spans are sorted: once a span starts at or past hi, no later span can
+  // overlap the move's open interval (lo, hi).
+  const blockedSpans = (list, lo, hi) => {
+    for (const [s0, s1] of list) {
+      if (s0 >= hi) break;
+      if (lo < s1 && s0 < hi) return true;
+    }
+    return false;
   };
+  const blockedH = (j, i0, i1) =>
+    blockedSpans(spansH[j], Math.min(X[i0], X[i1]), Math.max(X[i0], X[i1]));
+  const blockedV = (i, j0, j1) =>
+    blockedSpans(spansV[i], Math.min(Y[j0], Y[j1]), Math.max(Y[j0], Y[j1]));
 
   const N = nx * ny * 2;
   const dist = new Float64Array(N).fill(Infinity);
@@ -1411,9 +1603,22 @@ function routeOrthogonal(a, b, obstacles, M = GRID) {
 // The result is always orthogonal: moveSegment() only ever shifts one axis, and
 // edgePoints() re-bridges anything else (a collapsed run, hand-edited or
 // imported waypoints).
-export function edgePoints(a, b, corners = [], obstacles = null) {
+// The obstacle-avoiding route from port a to port b, memoised per edge id
+// (see routeSignature). Falls through to a fresh BFS on a miss; manual-waypoint
+// edges never use the cache.
+function autoRoute(edgeId, a, b, obstacles) {
+  if (!edgeId || !obstacles || !obstacles.length) return routeOrthogonal(a, b, obstacles);
+  const hit = routeCache.get(edgeId);
+  const sig = routeSignature(a, b, obstacles);
+  if (hit && hit.sig === sig) return hit.pts;
+  const pts = routeOrthogonal(a, b, obstacles);
+  routeCache.set(edgeId, { sig, pts });
+  return pts;
+}
+
+export function edgePoints(a, b, corners = [], obstacles = null, edgeId = null) {
   if (!corners.length && obstacles && obstacles.length) {
-    const auto = routeOrthogonal(a, b, obstacles);
+    const auto = autoRoute(edgeId, a, b, obstacles);
     if (auto) return simplify(dedupe(orthogonalize([a, ...auto, b])));
   }
   const mid = snapToGrid((a.x + b.x) / 2);
@@ -1597,7 +1802,8 @@ export function edgesNearPoint(model, p, maxDist = 8) {
   for (const edge of model.edges) {
     const ends = edgeEnds(model, edge);
     if (!ends) continue;
-    const pts = edgePoints(ends.a, ends.b, edge.points, obstacles);
+    // edge.id passed so repeat picks reuse the memoised auto routes.
+    const pts = edgePoints(ends.a, ends.b, edge.points, obstacles, edge.id);
     let d = Infinity;
     for (let i = 0; i + 1 < pts.length; i++) d = Math.min(d, distToSegment(p.x, p.y, pts[i], pts[i + 1]));
     if (d <= maxDist) found.push({ id: edge.id, d });
@@ -1788,7 +1994,7 @@ export class Renderer {
     for (const edge of edges) {
       const ends = edgeEnds(model, edge);
       if (!ends) continue;
-      const pts = edgePoints(ends.a, ends.b, edge.points, nodeRects(model));
+      const pts = edgePoints(ends.a, ends.b, edge.points, nodeRects(model), edge.id);
       scene.paths.push({ pts, stroke: normalizeColor(edge.color) || colors.edge, strokeWidth: 2, dash: EDGE_DASH });
       if (edge.label) {
         const pos = polylinePointAt(pts, edge.labelT);
@@ -1810,7 +2016,7 @@ export class Renderer {
     // every pointermove for every auto edge. A cheap Z-route stands in until
     // the drop, when the final render routes properly once.
     const obs = dragging && !edge.points.length ? null : obstacles;
-    const pts = edgePoints(a, b, edge.points, obs);
+    const pts = edgePoints(a, b, edge.points, obs, edge.id);
     const d = polylinePath(pts);
     // invisible wide path in the hit layer (below the nodes) so thin edges are
     // easy to click without stealing clicks from nodes/ports they pass over
@@ -1860,11 +2066,7 @@ export class Renderer {
         class: 'ng-edge-label' + (edge.label ? '' : ' ng-edge-label-hint'),
         'data-edgelabel': edge.id, 'data-edge': edge.id,
       }, this.overlayLayer).textContent = text;
-      let w = text.length * 6.5 + 16;
-      try {
-        const bb = this.overlayLayer.lastChild.getBBox();
-        if (bb && bb.width) w = bb.width + 16;
-      } catch { /* layout unavailable */ }
+      let w = labelWidth(text);
       el('rect', {
         x: pos.x - w / 2, y: pos.y - 20, width: w, height: 16,
         class: 'ng-edge-label-hit', 'data-edgelabel': edge.id, 'data-edge': edge.id,
@@ -2035,6 +2237,7 @@ function applyImportJSON(model, text) {
   model.nodes = next.nodes;
   model.edges = next.edges;
   model.groups = next.groups;
+  invalidateRects();
 }
 
 // --- undo / redo ---------------------------------------------------------
@@ -2055,6 +2258,7 @@ function createHistory(model, onRestore) {
     model.nodes = s.nodes;
     model.edges = s.edges;
     model.groups = s.groups;
+    invalidateRects();
   };
   const pushEntry = (entry) => {
     undoStack.push(entry);
@@ -2137,6 +2341,34 @@ function setupInteractions(model, renderer, render, history) {
     if (!same) render();
   };
 
+  // Render scheduler for continuous gestures. A pointermove fires far more often
+  // than the display refreshes, and each render() rebuilds the whole SVG — so
+  // mid-drag renders are coalesced into one per animation frame (trailing).
+  // Discrete operations (public API, undo/redo, import) keep calling render()
+  // synchronously; pointerup flushes any pending frame before finalising a
+  // gesture so the committed state is always rendered deterministically.
+  let renderRaf = null;
+  let pendingDragging = false;
+  const flushRender = () => {
+    if (renderRaf == null) return;
+    cancelAnimationFrame(renderRaf);
+    renderRaf = null;
+    const dragging = pendingDragging;
+    pendingDragging = false;
+    render(dragging);
+  };
+  const scheduleRender = (dragging = false) => {
+    pendingDragging = pendingDragging || dragging;
+    if (renderRaf != null) return;
+    if (typeof requestAnimationFrame !== 'function') { flushRender(); return; }
+    renderRaf = requestAnimationFrame(() => {
+      renderRaf = null;
+      const d = pendingDragging;
+      pendingDragging = false;
+      render(d);
+    });
+  };
+
   // Shift-click: toggle one id in a selection set (nodes or groups), dropping
   // any edge selection, and re-render.
   const toggleSelect = (set, id) => {
@@ -2212,7 +2444,7 @@ function setupInteractions(model, renderer, render, history) {
     for (const edge of model.edges) {
       const ends = edgeEnds(model, edge);
       if (!ends) continue;
-      for (const p of edgePoints(ends.a, ends.b, edge.points, obstacles)) bb.grow(p.x, p.y);
+      for (const p of edgePoints(ends.a, ends.b, edge.points, obstacles, edge.id)) bb.grow(p.x, p.y);
     }
     const b = bb.box();
     if (!b) return resetView(); // nothing to frame
@@ -2363,7 +2595,7 @@ function setupInteractions(model, renderer, render, history) {
       w = Math.max(110, r.width + 32);
     } else {
       const ends = edgeEnds(model, edge);
-      const pts = ends ? edgePoints(ends.a, ends.b, edge.points, nodeRects(model)) : [];
+      const pts = ends ? edgePoints(ends.a, ends.b, edge.points, nodeRects(model), edge.id) : [];
       const pos = pts.length ? polylinePointAt(pts, edge.labelT) : { x: 0, y: 0 };
       const p = graphToScreen(pos.x, pos.y);
       sx = p.x - 60;
@@ -3077,7 +3309,7 @@ function setupInteractions(model, renderer, render, history) {
         moveGroupsBy(model, drag.scope.groupIds, drag.scope.nodeIds, dx, dy);
         drag.ox += dx;
         drag.oy += dy;
-        render(true);
+        scheduleRender(true);
       }
     } else if (drag.kind === 'resize-group') {
       const group = findGroup(model, drag.id);
@@ -3109,7 +3341,7 @@ function setupInteractions(model, renderer, render, history) {
         h = Math.max(GROUP_MIN, snapToGrid(drag.baseH + dy));
       }
       setGroupRect(model, group.id, { x, y, w, h });
-      render();
+      scheduleRender();
     } else if (drag.kind === 'node') {
       const p = screenToGraph(e.clientX, e.clientY);
       drag.moved = true; // any movement re-rendered with the cheap router → pointerup must re-route
@@ -3132,7 +3364,8 @@ function setupInteractions(model, renderer, render, history) {
           }
         }
       });
-      render(true);
+      invalidateRects();
+      scheduleRender(true);
     } else if (drag.kind === 'resize') {
       const node = findNode(model, drag.id);
       if (!node) return;
@@ -3142,7 +3375,7 @@ function setupInteractions(model, renderer, render, history) {
       if (nodeWidth(node) !== w) {
         drag.moved = true;
         setNodeWidth(model, node.id, w);
-        render();
+        scheduleRender();
       }
     } else if (drag.kind === 'gport-move') {
       const group = findGroup(model, drag.groupId);
@@ -3163,7 +3396,7 @@ function setupInteractions(model, renderer, render, history) {
       followWaypoints(model, (edge) => edge.source.group === group.id || edge.target.group === group.id, () => {
         gport.t = t;
       });
-      render();
+      scheduleRender();
     } else if (drag.kind === 'connect') {
       const p = screenToGraph(e.clientX, e.clientY);
       // draw the rubber band out of the port you grabbed, into the cursor
@@ -3179,13 +3412,13 @@ function setupInteractions(model, renderer, render, history) {
       const p = screenToGraph(e.clientX, e.clientY);
       const next = moveSegment(ends.a, ends.b, drag.base, drag.index, Math.round(p.x - drag.ox), Math.round(p.y - drag.oy), nodeRects(model), true);
       setEdgePoints(model, edge.id, next);
-      render();
+      scheduleRender();
     } else if (drag.kind === 'label') {
       const edge = findEdge(model, drag.edgeId);
       if (!edge) return;
       const ends = edgeEnds(model, edge);
       if (!ends) return;
-      const pts = edgePoints(ends.a, ends.b, edge.points, nodeRects(model));
+      const pts = edgePoints(ends.a, ends.b, edge.points, nodeRects(model), edge.id);
       const p = screenToGraph(e.clientX, e.clientY);
       const idx = nearestSegment(pts, p.x, p.y, Infinity);
       if (idx < 0) return;
@@ -3200,7 +3433,7 @@ function setupInteractions(model, renderer, render, history) {
       for (let i = 1; i <= idx; i++) len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
       len += Math.hypot(proj.x - a.x, proj.y - a.y);
       setEdgeLabelT(model, edge.id, len / (polylineLength(pts) || 1));
-      render();
+      scheduleRender();
     } else if (drag.kind === 'marquee') {
       const p = screenToGraph(e.clientX, e.clientY);
       const x = Math.min(drag.ox, p.x);
@@ -3221,7 +3454,7 @@ function setupInteractions(model, renderer, render, history) {
       selEdge = null;
       selGroups.clear();
       for (const id of hitGroups) selGroups.add(id);
-      render();
+      scheduleRender();
       renderer.drawMarquee(x, y, w, h);
     }
   };
@@ -3289,6 +3522,9 @@ function setupInteractions(model, renderer, render, history) {
 
   const onPointerUp = (e) => {
     if (!drag) return;
+    // Commit any frame coalesced during the gesture before finalising, so the
+    // drop state renders deterministically (and no stale rAF fires afterwards).
+    flushRender();
     svg.classList.remove('ng-panning');
     // Close out any gesture that could have mutated the model: the pre-state
     // taken at drag start becomes an undo step only if something changed.
@@ -3601,6 +3837,7 @@ function setupInteractions(model, renderer, render, history) {
       closeEditor(false);
       closeMenu();
       clearTimeout(toastTimer);
+      if (renderRaf != null) { cancelAnimationFrame(renderRaf); renderRaf = null; pendingDragging = false; }
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
       window.removeEventListener('keydown', onKeyDown);
